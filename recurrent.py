@@ -72,7 +72,6 @@ class LSTMCell(RNNCellBase):
         self,
         in_features: int,
         hidden_features: int,
-        out_features: int,
         *,
         gate_fn: Callable[..., Any] = sigmoid,
         activation_fn: Callable[..., Any] = tanh,
@@ -86,7 +85,6 @@ class LSTMCell(RNNCellBase):
     ):
         self.in_features = in_features
         self.hidden_features = hidden_features
-        self.out_features = out_features
         self.gate_fn = gate_fn
         self.activation_fn = activation_fn
         self.kernel_init = kernel_init
@@ -180,7 +178,6 @@ class SimpleCell(RNNCellBase):
         self,
         in_features: int,
         hidden_features: int,  # not inferred from carry for now
-        out_features: int,
         *,
         dtype: Dtype = jnp.float32,
         param_dtype: Dtype = jnp.float32,
@@ -194,7 +191,6 @@ class SimpleCell(RNNCellBase):
     ):
         self.in_features = in_features
         self.hidden_features = hidden_features
-        self.out_features = out_features
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.carry_init = carry_init
@@ -481,9 +477,9 @@ if __name__ == "__main__":
     batch_size, seq_len, feature_size, hidden_size = 2,3,4,5 #48, 32, 16, 64
     x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, feature_size))
     # layer = SimpleCell(
-    #     in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs
+    #     in_features=feature_size, hidden_features=hidden_size, rngs=rngs
     # )
-    layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs)
+    layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, rngs=rngs)
     rnn = RNN(layer, time_major=True, reverse=True, keep_order=False, unroll=1)
     from timeit import timeit
 
