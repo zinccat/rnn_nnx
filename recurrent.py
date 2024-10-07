@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import (
     Any,
     TypeVar,
@@ -12,8 +10,7 @@ import jax.numpy as jnp
 
 from flax import nnx
 
-from jax import random
-from flax.nnx import Module  # , first_from
+from flax.nnx import Module
 from flax.nnx import initializers
 from flax.nnx import sigmoid, tanh
 from flax.nnx import Carry
@@ -25,10 +22,8 @@ from flax.typing import (
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
 
-A = TypeVar('A')
+A = TypeVar("A")
 Array = jax.Array
-# Carry = Any
-
 
 
 class RNNCellBase(Module):
@@ -179,6 +174,7 @@ class LSTMCell(RNNCellBase):
     def num_feature_axes(self) -> int:
         return 1
 
+
 class SimpleCell(RNNCellBase):
     def __init__(
         self,
@@ -270,6 +266,7 @@ class SimpleCell(RNNCellBase):
     def num_feature_axes(self) -> int:
         return 1
 
+
 class RNN(Module):
     """The ``RNN`` module takes any :class:`RNNCellBase` instance and applies it over a sequence
 
@@ -284,13 +281,6 @@ class RNN(Module):
         reverse: bool = False,
         keep_order: bool = False,
         unroll: int = 1,
-        # variable_axes: Mapping[
-        #     CollectionFilter, InOutScanAxis
-        # ] = FrozenDict(),
-        # variable_broadcast: CollectionFilter = "params",
-        # variable_carry: CollectionFilter = False,
-        # split_rngs: Mapping[PRNGSequenceFilter, bool] = FrozenDict(
-        # {"params": False}
     ):
         self.cell = cell
         self.time_major = time_major
@@ -311,43 +301,59 @@ class RNN(Module):
         reverse: bool | None = None,
         keep_order: bool | None = None,
     ):
-        if time_major is None:
-            time_major = self.time_major
         if return_carry is None:
             return_carry = self.return_carry
+        if time_major is None:
+            time_major = self.time_major
         if reverse is None:
             reverse = self.reverse
         if keep_order is None:
             keep_order = self.keep_order
-    
+
         # Infer the number of batch dimensions from the input shape.
         # Cells like ConvLSTM have additional spatial dimensions.
-        time_axis = (
-            0 if time_major else inputs.ndim - (self.cell.num_feature_axes + 1)
-        )
+        time_axis = 0 if time_major else inputs.ndim - (self.cell.num_feature_axes + 1)
 
         # make time_axis positive
         if time_axis < 0:
             time_axis += inputs.ndim
 
         if time_major:
-        # we add +1 because we moved the time axis to the front
+            # we add +1 because we moved the time axis to the front
             batch_dims = inputs.shape[1 : -self.cell.num_feature_axes]
         else:
             batch_dims = inputs.shape[:time_axis]
 
-        carry: Carry = self.cell.initialize_carry(nnx.Rngs(0), inputs.shape) if initial_carry is None else initial_carry
+        # maybe reverse the sequence
+        if reverse:
+            inputs = jax.tree_util.tree_map(
+                lambda x: flip_sequences(
+                    x,
+                    seq_lengths,
+                    num_batch_dims=len(batch_dims),
+                    time_major=time_major,  # type: ignore
+                ),
+                inputs,
+            )
+
+        carry: Carry = (
+            self.cell.initialize_carry(
+                nnx.Rngs(0), inputs.shape[:time_axis] + inputs.shape[time_axis + 1 :]
+            )
+            if initial_carry is None
+            else initial_carry
+        )
+
         slice_carry = seq_lengths is not None and return_carry
 
         def scan_fn(carry: Carry, x: Array) -> tuple[Carry, Array]:
             carry, y = self.cell(carry, x)
             if slice_carry:
-               return carry, (carry, y)
+                return carry, (carry, y)
             return carry, y
-            
+
         scan = nnx.scan(
             scan_fn,
-            # length=inputs.shape[time_axis],
             in_axes=(Carry, time_axis),
             out_axes=(Carry, (Carry, time_axis)) if slice_carry else (Carry, time_axis),
             unroll=self.unroll,
@@ -367,21 +373,22 @@ class RNN(Module):
         else:
             carry, outputs = scan_output
 
-        # if reverse and keep_order:
-        #     outputs = jax.tree_util.tree_map(
-        #         lambda x: flip_sequences(
-        #             x,
-        #             seq_lengths,
-        #             num_batch_dims=len(batch_dims),
-        #             time_major=time_major,  # type: ignore
-        #         ),
-        #         outputs,
-        #     )
+        if reverse and keep_order:
+            outputs = jax.tree_util.tree_map(
+                lambda x: flip_sequences(
+                    x,
+                    seq_lengths,
+                    num_batch_dims=len(batch_dims),
+                    time_major=time_major,  # type: ignore
+                ),
+                outputs,
+            )
 
         if return_carry:
             return carry, outputs
         else:
             return outputs
+
 
 def _select_last_carry(sequence: A, seq_lengths: jnp.ndarray) -> A:
     last_idx = seq_lengths - 1
@@ -391,25 +398,94 @@ def _select_last_carry(sequence: A, seq_lengths: jnp.ndarray) -> A:
 
     return jax.tree_util.tree_map(_slice_array, sequence)
 
+
+def _expand_dims_like(x, target):
+    """Expands the shape of `x` to match `target`'s shape by adding singleton dimensions."""
+    return x.reshape(list(x.shape) + [1] * (target.ndim - x.ndim))
+
+
+def flip_sequences(
+    inputs: Array,
+    seq_lengths: Array | None,
+    num_batch_dims: int,
+    time_major: bool,
+) -> Array:
+    """Flips a sequence of inputs along the time axis.
+
+    This function can be used to prepare inputs for the reverse direction of a
+    bidirectional LSTM. It solves the issue that, when naively flipping multiple
+    padded sequences stored in a matrix, the first elements would be padding
+    values for those sequences that were padded. This function keeps the padding
+    at the end, while flipping the rest of the elements.
+
+    Example:
+    ```python
+    inputs = [[1, 0, 0],
+              [2, 3, 0]
+              [4, 5, 6]]
+    lengths = [1, 2, 3]
+    flip_sequences(inputs, lengths) = [[1, 0, 0],
+                                       [3, 2, 0],
+                                       [6, 5, 4]]
+    ```
+
+    Args:
+      inputs: An array of input IDs <int>[batch_size, seq_length].
+      lengths: The length of each sequence <int>[batch_size].
+
+    Returns:
+      An ndarray with the flipped inputs.
+    """
+    # Compute the indices to put the inputs in flipped order as per above example.
+    time_axis = 0 if time_major else num_batch_dims
+    max_steps = inputs.shape[time_axis]
+
+    if seq_lengths is None:
+        # reverse inputs and return
+        inputs = jnp.flip(inputs, axis=time_axis)
+        return inputs
+
+    seq_lengths = jnp.expand_dims(seq_lengths, axis=time_axis)
+
+    # create indexes
+    idxs = jnp.arange(max_steps - 1, -1, -1)  # [max_steps]
+    if time_major:
+        idxs = jnp.reshape(idxs, [max_steps] + [1] * num_batch_dims)
+    else:
+        idxs = jnp.reshape(
+            idxs, [1] * num_batch_dims + [max_steps]
+        )  # [1, ..., max_steps]
+    idxs = (idxs + seq_lengths) % max_steps  # [*batch, max_steps]
+    idxs = _expand_dims_like(idxs, target=inputs)  # [*batch, max_steps, *features]
+    # Select the inputs in flipped order.
+    outputs = jnp.take_along_axis(inputs, idxs, axis=time_axis)
+
+    return outputs
+
+
 @nnx.jit
 def run_layer(layer, inputs):
     carry = layer.initialize_carry(None, inputs.shape)
     carry, _ = layer(carry, inputs)
     return carry
 
+
 @nnx.jit
 def run_model(model, inputs):
     out = model(inputs)
     return out
 
+
 if __name__ == "__main__":
     rngs = nnx.Rngs(0)
-    batch_size, seq_len, feature_size, hidden_size = 48, 32, 16, 64
+    batch_size, seq_len, feature_size, hidden_size = 2,3,4,5 #48, 32, 16, 64
     x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, feature_size))
-    layer = SimpleCell(in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs)
-    # layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs)
-    rnn = RNN(layer, time_major=True)
+    # layer = SimpleCell(
+    #     in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs
+    # )
+    layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs)
+    rnn = RNN(layer, time_major=True, reverse=True, keep_order=False, unroll=1)
     from timeit import timeit
 
-    print(run_model(rnn, x).shape)
+    print(run_model(rnn, x))
     print(timeit(lambda: run_model(rnn, x), number=100))
