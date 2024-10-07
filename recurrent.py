@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import (
+    Any,
+    TypeVar,
+)
 from collections.abc import Callable
 from functools import partial
 
@@ -9,20 +12,23 @@ import jax.numpy as jnp
 
 from flax import nnx
 
+from jax import random
 from flax.nnx import Module  # , first_from
 from flax.nnx import initializers
 from flax.nnx import sigmoid, tanh
+from flax.nnx import Carry
 from flax.typing import (
     Dtype,
     Initializer,
 )
-from collections.abc import Callable, Mapping, Sequence
 
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
 
+A = TypeVar('A')
 Array = jax.Array
-Carry = Any
+# Carry = Any
+
 
 
 class RNNCellBase(Module):
@@ -99,7 +105,7 @@ class LSTMCell(RNNCellBase):
         dense_h = partial(
             nnx.Linear,
             in_features=hidden_features,
-            out_features=out_features,
+            out_features=hidden_features,
             use_bias=True,
             kernel_init=self.recurrent_kernel_init,
             bias_init=self.bias_init,
@@ -141,7 +147,7 @@ class LSTMCell(RNNCellBase):
           A tuple with the new carry and the output.
         """
         c, h = carry
-        
+
         i = self.gate_fn(self.ii(inputs) + self.hi(h))
         f = self.gate_fn(self.if_(inputs) + self.hf(h))
         g = self.activation_fn(self.ig(inputs) + self.hg(h))
@@ -264,17 +270,146 @@ class SimpleCell(RNNCellBase):
     def num_feature_axes(self) -> int:
         return 1
 
+class RNN(Module):
+    """The ``RNN`` module takes any :class:`RNNCellBase` instance and applies it over a sequence
+
+    using :func:`flax.linen.scan`.
+    """
+
+    def __init__(
+        self,
+        cell: RNNCellBase,
+        time_major: bool = False,
+        return_carry: bool = False,
+        reverse: bool = False,
+        keep_order: bool = False,
+        unroll: int = 1,
+        # variable_axes: Mapping[
+        #     CollectionFilter, InOutScanAxis
+        # ] = FrozenDict(),
+        # variable_broadcast: CollectionFilter = "params",
+        # variable_carry: CollectionFilter = False,
+        # split_rngs: Mapping[PRNGSequenceFilter, bool] = FrozenDict(
+        # {"params": False}
+    ):
+        self.cell = cell
+        self.time_major = time_major
+        self.return_carry = return_carry
+        self.reverse = reverse
+        self.keep_order = keep_order
+        self.unroll = unroll
+
+    def __call__(
+        self,
+        inputs: Array,
+        *,
+        initial_carry: Carry | None = None,
+        # init_key: PRNGKey | None = None,
+        seq_lengths: Array | None = None,
+        return_carry: bool | None = None,
+        time_major: bool | None = None,
+        reverse: bool | None = None,
+        keep_order: bool | None = None,
+    ):
+        if time_major is None:
+            time_major = self.time_major
+        if return_carry is None:
+            return_carry = self.return_carry
+        if reverse is None:
+            reverse = self.reverse
+        if keep_order is None:
+            keep_order = self.keep_order
+    
+        # Infer the number of batch dimensions from the input shape.
+        # Cells like ConvLSTM have additional spatial dimensions.
+        time_axis = (
+            0 if time_major else inputs.ndim - (self.cell.num_feature_axes + 1)
+        )
+
+        # make time_axis positive
+        if time_axis < 0:
+            time_axis += inputs.ndim
+
+        if time_major:
+        # we add +1 because we moved the time axis to the front
+            batch_dims = inputs.shape[1 : -self.cell.num_feature_axes]
+        else:
+            batch_dims = inputs.shape[:time_axis]
+
+        carry: Carry = self.cell.initialize_carry(nnx.Rngs(0), inputs.shape) if initial_carry is None else initial_carry
+        slice_carry = seq_lengths is not None and return_carry
+
+        def scan_fn(carry: Carry, x: Array) -> tuple[Carry, Array]:
+            carry, y = self.cell(carry, x)
+            if slice_carry:
+               return carry, (carry, y)
+            return carry, y
+            
+        scan = nnx.scan(
+            scan_fn,
+            # length=inputs.shape[time_axis],
+            in_axes=(Carry, time_axis),
+            out_axes=(Carry, (Carry, time_axis)) if slice_carry else (Carry, time_axis),
+            unroll=self.unroll,
+        )
+
+        scan_output = scan(carry, inputs)
+
+        # Next we select the final carry. If a segmentation mask was provided and
+        # return_carry is True we slice the carry history and select the last valid
+        # carry for each sequence. Otherwise we just use the last carry.
+        if slice_carry:
+            assert seq_lengths is not None
+            _, (carries, outputs) = scan_output
+            # seq_lengths[None] expands the shape of the mask to match the
+            # number of dimensions of the carry.
+            carry = _select_last_carry(carries, seq_lengths)
+        else:
+            carry, outputs = scan_output
+
+        # if reverse and keep_order:
+        #     outputs = jax.tree_util.tree_map(
+        #         lambda x: flip_sequences(
+        #             x,
+        #             seq_lengths,
+        #             num_batch_dims=len(batch_dims),
+        #             time_major=time_major,  # type: ignore
+        #         ),
+        #         outputs,
+        #     )
+
+        if return_carry:
+            return carry, outputs
+        else:
+            return outputs
+
+def _select_last_carry(sequence: A, seq_lengths: jnp.ndarray) -> A:
+    last_idx = seq_lengths - 1
+
+    def _slice_array(x: jnp.ndarray):
+        return x[last_idx, jnp.arange(x.shape[1])]
+
+    return jax.tree_util.tree_map(_slice_array, sequence)
+
 @nnx.jit
-def run(model, inputs):
-    carry = model.initialize_carry(None, inputs.shape)
-    carry, _ = model(carry, inputs)
+def run_layer(layer, inputs):
+    carry = layer.initialize_carry(None, inputs.shape)
+    carry, _ = layer(carry, inputs)
     return carry
+
+@nnx.jit
+def run_model(model, inputs):
+    out = model(inputs)
+    return out
 
 if __name__ == "__main__":
     rngs = nnx.Rngs(0)
-    x = jax.random.normal(jax.random.PRNGKey(0), (64, 32))
-    layer = SimpleCell(in_features=32, hidden_features=64, out_features=64, rngs=rngs)
-    # layer = LSTMCell(in_features=3, hidden_features=4, out_features=4, rngs=rngs)
+    batch_size, seq_len, feature_size, hidden_size = 48, 32, 16, 64
+    x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, feature_size))
+    layer = SimpleCell(in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs)
+    # layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, out_features=4, rngs=rngs)
+    rnn = RNN(layer, time_major=True)
     from timeit import timeit
-    run(layer, x)
-    print(timeit(lambda: run(layer, x), number=1000))
+
+    print(run_model(rnn, x).shape)
+    print(timeit(lambda: run_model(rnn, x), number=100))
