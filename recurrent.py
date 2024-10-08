@@ -46,6 +46,23 @@ class RNNCellBase(Module):
           An initialized carry for the given RNN cell.
         """
         raise NotImplementedError
+    
+    def __call__(
+        self,
+        carry: Carry,
+        inputs: Array
+    ) -> Tuple[Carry, Array]:
+        """Run the RNN cell.
+
+        Args:
+          carry: the hidden state of the RNN cell.
+          inputs: an ndarray with the input for the current time step.
+            All dimensions except the final are considered batch dimensions.
+
+        Returns:
+          A tuple with the new carry and the output.
+        """
+        raise NotImplementedError
 
     @property
     def num_feature_axes(self) -> int:
@@ -168,8 +185,8 @@ class LSTMCell(RNNCellBase):
         if rngs is None:
             rngs = self.rngs
         mem_shape = batch_dims + (self.hidden_features,)
-        c = self.carry_init(rngs, mem_shape, self.param_dtype)
-        h = self.carry_init(rngs, mem_shape, self.param_dtype)
+        c = self.carry_init(rngs.params(), mem_shape, self.param_dtype)
+        h = self.carry_init(rngs.params(), mem_shape, self.param_dtype)
         return (c, h)
 
     @property
@@ -309,8 +326,8 @@ class OptimizedLSTMCell(RNNCellBase):
         if rngs is None:
             rngs = self.rngs
         mem_shape = batch_dims + (self.hidden_features,)
-        c = self.carry_init(rngs, mem_shape, self.param_dtype)
-        h = self.carry_init(rngs, mem_shape, self.param_dtype)
+        c = self.carry_init(rngs.params(), mem_shape, self.param_dtype)
+        h = self.carry_init(rngs.params(), mem_shape, self.param_dtype)
         return (c, h)
 
     @property
@@ -389,7 +406,7 @@ class SimpleCell(RNNCellBase):
             rngs=rngs,
         )
 
-    def __call__(self, carry, inputs, *, rngs: nnx.Rngs | None = None):
+    def __call__(self, carry, inputs):
         new_carry = self.dense_i(inputs) + self.dense_h(carry)
         if self.residual:
             new_carry += carry
@@ -410,7 +427,7 @@ class SimpleCell(RNNCellBase):
             rngs = self.rngs
         batch_dims = input_shape[:-1]
         mem_shape = batch_dims + (self.hidden_features,)
-        return self.carry_init(rngs, mem_shape, self.param_dtype)
+        return self.carry_init(rngs.params(), mem_shape, self.param_dtype)
 
     @property
     def num_feature_axes(self) -> int:
@@ -546,7 +563,7 @@ class GRUCell(RNNCellBase):
         if rngs is None:
             rngs = self.rngs
         mem_shape = batch_dims + (self.hidden_features,)
-        h = self.carry_init(rngs, mem_shape, self.param_dtype)
+        h = self.carry_init(rngs.params(), mem_shape, self.param_dtype)
         return h
 
     @property
