@@ -16,7 +16,14 @@ if __name__ == "__main__":
     #     in_features=feature_size, hidden_features=hidden_size, rngs=rngs
     # )
     layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, rngs=rngs)
-    rnn = RNN(layer, time_major=True, reverse=True, keep_order=False, unroll=1)
+    rnn = RNN(layer, time_major=False, reverse=False, keep_order=False, unroll=1)
 
     print(run_model(rnn, x))
+
+    bidirectional = Bidirectional(
+        forward_rnn=rnn, backward_rnn=rnn, time_major=False, return_carry=True
+    )
+    ((c1, h1), (c2, h2)), output = run_model(bidirectional, x) # for lstm
+    print(output.shape)
+    print(c1.shape)
 ```

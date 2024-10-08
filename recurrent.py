@@ -1,9 +1,12 @@
 from typing import (
     Any,
     TypeVar,
+    Tuple,
 )
 from collections.abc import Callable
 from functools import partial
+from typing_extensions import Protocol
+from absl import logging
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +27,7 @@ default_bias_init = initializers.zeros_init()
 
 A = TypeVar("A")
 Array = jax.Array
+Output = Any
 
 
 class RNNCellBase(Module):
@@ -173,7 +177,169 @@ class LSTMCell(RNNCellBase):
         return 1
 
 
+class OptimizedLSTMCell(RNNCellBase):
+    r"""More efficient LSTM Cell that concatenates state components before matmul.
+
+    The parameters are compatible with ``LSTMCell``. Note that this cell is often
+    faster than ``LSTMCell`` as long as the hidden size is roughly <= 2048 units.
+
+    The mathematical definition of the cell is the same as ``LSTMCell`` and as
+    follows:
+
+    .. math::
+
+        \begin{array}{ll}
+        i = \sigma(W_{ii} x + W_{hi} h + b_{hi}) \\
+        f = \sigma(W_{if} x + W_{hf} h + b_{hf}) \\
+        g = \tanh(W_{ig} x + W_{hg} h + b_{hg}) \\
+        o = \sigma(W_{io} x + W_{ho} h + b_{ho}) \\
+        c' = f * c + i * g \\
+        h' = o * \tanh(c') \\
+        \end{array}
+
+    where x is the input, h is the output of the previous time step, and c is
+    the memory.
+
+    Attributes:
+        gate_fn: activation function used for gates (default: sigmoid).
+        activation_fn: activation function used for output and memory update
+          (default: tanh).
+        kernel_init: initializer function for the kernels that transform
+          the input (default: lecun_normal).
+        recurrent_kernel_init: initializer function for the kernels that transform
+          the hidden state (default: initializers.orthogonal()).
+        bias_init: initializer for the bias parameters (default: initializers.zeros_init()).
+        dtype: the dtype of the computation (default: infer from inputs and params).
+        param_dtype: the dtype passed to parameter initializers (default: float32).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        *,
+        gate_fn: Callable[..., Any] = sigmoid,
+        activation_fn: Callable[..., Any] = tanh,
+        kernel_init: Initializer = default_kernel_init,
+        recurrent_kernel_init: Initializer = initializers.orthogonal(),
+        bias_init: Initializer = initializers.zeros_init(),
+        dtype: Dtype | None = None,
+        param_dtype: Dtype = jnp.float32,
+        carry_init: Initializer = initializers.zeros_init(),
+        rngs: nnx.Rngs,
+    ):
+        self.in_features = in_features
+        self.hidden_features = hidden_features
+        self.gate_fn = gate_fn
+        self.activation_fn = activation_fn
+        self.kernel_init = kernel_init
+        self.recurrent_kernel_init = recurrent_kernel_init
+        self.bias_init = bias_init
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.carry_init = carry_init
+        self.rngs = rngs
+
+        # input and recurrent layers are summed so only one needs a bias.
+        self.dense_i = nnx.Linear(
+            in_features=in_features,
+            out_features=4 * hidden_features,
+            use_bias=False,
+            kernel_init=self.kernel_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            rngs=rngs,
+        )
+
+        self.dense_h = nnx.Linear(
+            in_features=hidden_features,
+            out_features=4 * hidden_features,
+            use_bias=True,
+            kernel_init=self.recurrent_kernel_init,
+            bias_init=self.bias_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            rngs=rngs,
+        )
+
+    def __call__(self, carry, inputs):
+        r"""An optimized long short-term memory (LSTM) cell.
+
+        Args:
+          carry: the hidden state of the LSTM cell, initialized using
+            ``LSTMCell.initialize_carry``.
+          inputs: an ndarray with the input for the current time step.
+            All dimensions except the final are considered batch dimensions.
+
+        Returns:
+          A tuple with the new carry and the output.
+        """
+        c, h = carry
+
+        # Compute combined transformations for inputs and hidden state
+        y = self.dense_i(inputs) + self.dense_h(h)
+
+        # Split the combined transformations into individual gates
+        i, f, g, o = jnp.split(y, indices_or_sections=4, axis=-1)
+
+        # Apply gate activations
+        i = self.gate_fn(i)
+        f = self.gate_fn(f)
+        g = self.activation_fn(g)
+        o = self.gate_fn(o)
+
+        # Update cell state and hidden state
+        new_c = f * c + i * g
+        new_h = o * self.activation_fn(new_c)
+        return (new_c, new_h), new_h
+
+    def initialize_carry(
+        self, rngs: nnx.Rngs | None, input_shape: tuple[int, ...]
+    ) -> tuple[Array, Array]:
+        """Initialize the RNN cell carry.
+
+        Args:
+          rngs: random number generator passed to the init_fn.
+          input_shape: a tuple providing the shape of the input to the cell.
+
+        Returns:
+          An initialized carry for the given RNN cell.
+        """
+        batch_dims = input_shape[:-1]
+        if rngs is None:
+            rngs = self.rngs
+        mem_shape = batch_dims + (self.hidden_features,)
+        c = self.carry_init(rngs, mem_shape, self.param_dtype)
+        h = self.carry_init(rngs, mem_shape, self.param_dtype)
+        return (c, h)
+
+    @property
+    def num_feature_axes(self) -> int:
+        return 1
+
+
 class SimpleCell(RNNCellBase):
+    r"""Simple cell.
+
+    The mathematical definition of the cell is as follows
+
+    .. math::
+
+        \begin{array}{ll}
+        h' = \tanh(W_i x + b_i + W_h h)
+        \end{array}
+
+    where x is the input and h is the output of the previous time step.
+
+    If `residual` is `True`,
+
+    .. math::
+
+        \begin{array}{ll}
+        h' = \tanh(W_i x + b_i + W_h h + h)
+        \end{array}
+    """
+
     def __init__(
         self,
         in_features: int,
@@ -224,18 +390,6 @@ class SimpleCell(RNNCellBase):
         )
 
     def __call__(self, carry, inputs, *, rngs: nnx.Rngs | None = None):
-        """Simple cell.
-
-        Args:
-          carry: the hidden state of the Simple cell,
-            initialized using ``SimpleCell.initialize_carry``.
-          inputs: an ndarray with the input for the current time step.
-            All dimensions except the final are considered batch dimensions.
-
-        Returns:
-          A tuple with the new carry and the output.
-        """
-
         new_carry = self.dense_i(inputs) + self.dense_h(carry)
         if self.residual:
             new_carry += carry
@@ -257,6 +411,143 @@ class SimpleCell(RNNCellBase):
         batch_dims = input_shape[:-1]
         mem_shape = batch_dims + (self.hidden_features,)
         return self.carry_init(rngs, mem_shape, self.param_dtype)
+
+    @property
+    def num_feature_axes(self) -> int:
+        return 1
+
+
+class GRUCell(RNNCellBase):
+    r"""GRU cell.
+
+    The mathematical definition of the cell is as follows
+
+    .. math::
+
+        \begin{array}{ll}
+        r = \sigma(W_{ir} x + b_{ir} + W_{hr} h) \\
+        z = \sigma(W_{iz} x + b_{iz} + W_{hz} h) \\
+        n = \tanh(W_{in} x + b_{in} + r * (W_{hn} h + b_{hn})) \\
+        h' = (1 - z) * n + z * h \\
+        \end{array}
+
+    where x is the input and h is the output of the previous time step.
+
+    Attributes:
+        in_features: number of input features.
+        hidden_features: number of output features.
+        gate_fn: activation function used for gates (default: sigmoid).
+        activation_fn: activation function used for output and memory update
+          (default: tanh).
+        kernel_init: initializer function for the kernels that transform
+          the input (default: lecun_normal).
+        recurrent_kernel_init: initializer function for the kernels that transform
+          the hidden state (default: initializers.orthogonal()).
+        bias_init: initializer for the bias parameters (default: initializers.zeros_init()).
+        dtype: the dtype of the computation (default: None).
+        param_dtype: the dtype passed to parameter initializers (default: float32).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        *,
+        gate_fn: Callable[..., Any] = sigmoid,
+        activation_fn: Callable[..., Any] = tanh,
+        kernel_init: Initializer = default_kernel_init,
+        recurrent_kernel_init: Initializer = initializers.orthogonal(),
+        bias_init: Initializer = initializers.zeros_init(),
+        dtype: Dtype | None = None,
+        param_dtype: Dtype = jnp.float32,
+        carry_init: Initializer = initializers.zeros_init(),
+        rngs: nnx.Rngs,
+    ):
+        self.in_features = in_features
+        self.hidden_features = hidden_features
+        self.gate_fn = gate_fn
+        self.activation_fn = activation_fn
+        self.kernel_init = kernel_init
+        self.recurrent_kernel_init = recurrent_kernel_init
+        self.bias_init = bias_init
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.carry_init = carry_init
+        self.rngs = rngs
+
+        # Combine input transformations into a single linear layer
+        self.dense_i = nnx.Linear(
+            in_features=in_features,
+            out_features=3 * hidden_features,  # r, z, n
+            use_bias=True,
+            kernel_init=self.kernel_init,
+            bias_init=self.bias_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            rngs=rngs,
+        )
+
+        self.dense_h = nnx.Linear(
+            in_features=hidden_features,
+            out_features=3 * hidden_features,  # r, z, n
+            use_bias=False,
+            kernel_init=self.recurrent_kernel_init,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            rngs=rngs,
+        )
+
+    def __call__(self, carry, inputs):
+        """Gated recurrent unit (GRU) cell.
+
+        Args:
+            carry: the hidden state of the GRU cell,
+              initialized using ``GRUCell.initialize_carry``.
+            inputs: an ndarray with the input for the current time step.
+              All dimensions except the final are considered batch dimensions.
+
+        Returns:
+            A tuple with the new carry and the output.
+        """
+        h = carry
+
+        # Compute combined transformations for inputs and hidden state
+        x_transformed = self.dense_i(inputs)
+        h_transformed = self.dense_h(h)
+
+        # Split the combined transformations into individual components
+        xi_r, xi_z, xi_n = jnp.split(x_transformed, 3, axis=-1)
+        hh_r, hh_z, hh_n = jnp.split(h_transformed, 3, axis=-1)
+
+        # Compute gates
+        r = self.gate_fn(xi_r + hh_r)
+        z = self.gate_fn(xi_z + hh_z)
+
+        # Compute n with an additional linear transformation on h
+        n = self.activation_fn(xi_n + r * hh_n)
+
+        # Update hidden state
+        new_h = (1.0 - z) * n + z * h
+        return new_h, new_h
+
+    def initialize_carry(
+        self, rngs: nnx.Rngs | None, input_shape: tuple[int, ...]
+    ) -> Array:
+        """Initialize the RNN cell carry.
+
+        Args:
+            rngs: random number generator passed to the init_fn.
+            input_shape: a tuple providing the shape of the input to the cell.
+
+        Returns:
+            An initialized carry for the given RNN cell.
+        """
+        batch_dims = input_shape[:-1]
+        if rngs is None:
+            rngs = self.rngs
+        mem_shape = batch_dims + (self.hidden_features,)
+        h = self.carry_init(rngs, mem_shape, self.param_dtype)
+        return h
 
     @property
     def num_feature_axes(self) -> int:
@@ -290,12 +581,12 @@ class RNN(Module):
         inputs: Array,
         *,
         initial_carry: Carry | None = None,
-        # init_key: PRNGKey | None = None,
         seq_lengths: Array | None = None,
         return_carry: bool | None = None,
         time_major: bool | None = None,
         reverse: bool | None = None,
         keep_order: bool | None = None,
+        rngs: nnx.Rngs | None = None,
     ):
         if return_carry is None:
             return_carry = self.return_carry
@@ -331,10 +622,11 @@ class RNN(Module):
                 ),
                 inputs,
             )
-
+        if rngs is None:
+            rngs = nnx.Rngs(0)
         carry: Carry = (
             self.cell.initialize_carry(
-                nnx.Rngs(0), inputs.shape[:time_axis] + inputs.shape[time_axis + 1 :]
+                rngs, inputs.shape[:time_axis] + inputs.shape[time_axis + 1 :]
             )
             if initial_carry is None
             else initial_carry
@@ -459,6 +751,137 @@ def flip_sequences(
     return outputs
 
 
+def _concatenate(a: Array, b: Array) -> Array:
+    """Concatenates two arrays along the last dimension."""
+    return jnp.concatenate([a, b], axis=-1)
+
+
+class RNNBase(Protocol):
+    def __call__(
+        self,
+        inputs: Array,
+        *,
+        initial_carry: Carry | None = None,
+        rngs: nnx.Rngs | None = None,
+        seq_lengths: Array | None = None,
+        return_carry: bool | None = None,
+        time_major: bool | None = None,
+        reverse: bool | None = None,
+        keep_order: bool | None = None,
+    ) -> Output | Tuple[Carry, Output]: ...
+
+
+class Bidirectional(Module):
+    """Processes the input in both directions and merges the results.
+
+    Example usage:
+
+    ```python
+    import nnx
+    import jax
+    import jax.numpy as jnp
+
+    # Define forward and backward RNNs
+    forward_rnn = RNN(GRUCell(in_features=3, hidden_features=4, rngs=nnx.Rngs(0)))
+    backward_rnn = RNN(GRUCell(in_features=3, hidden_features=4, rngs=nnx.Rngs(0)))
+
+    # Create Bidirectional layer
+    layer = Bidirectional(forward_rnn=forward_rnn, backward_rnn=backward_rnn)
+
+    # Input data
+    x = jnp.ones((2, 3, 3))
+
+    # Apply the layer
+    out = layer(x)
+    print(out.shape)
+    ```
+    """
+
+    forward_rnn: RNNBase
+    backward_rnn: RNNBase
+    merge_fn: Callable[[Array, Array], Array] = _concatenate
+    time_major: bool = False
+    return_carry: bool = False
+
+    def __init__(
+        self,
+        forward_rnn: RNNBase,
+        backward_rnn: RNNBase,
+        *,
+        merge_fn: Callable[[Array, Array], Array] = _concatenate,
+        time_major: bool = False,
+        return_carry: bool = False,
+    ):
+        self.forward_rnn = forward_rnn
+        self.backward_rnn = backward_rnn
+        self.merge_fn = merge_fn
+        self.time_major = time_major
+        self.return_carry = return_carry
+
+    def __call__(
+        self,
+        inputs: Array,
+        *,
+        initial_carry: Carry | None = None,
+        rngs: nnx.Rngs | None = None,
+        seq_lengths: Array | None = None,
+        return_carry: bool | None = None,
+        time_major: bool | None = None,
+        reverse: bool | None = None,  # unused
+        keep_order: bool | None = None,  # unused
+    ) -> Output | Tuple[Tuple[Carry, Carry], Output]:
+        if time_major is None:
+            time_major = self.time_major
+        if return_carry is None:
+            return_carry = self.return_carry
+        if rngs is None:
+            rngs = nnx.Rngs(0)
+        if initial_carry is not None:
+            initial_carry_forward, initial_carry_backward = initial_carry
+        else:
+            initial_carry_forward = initial_carry_backward = None
+        # Throw a warning in case the user accidentally re-uses the forward RNN
+        # for the backward pass and does not intend for them to share parameters.
+        if self.forward_rnn is self.backward_rnn:
+            logging.warning(
+                "forward_rnn and backward_rnn is the same object, so "
+                "they will share parameters."
+            )
+
+        # Encode in the forward direction.
+        carry_forward, outputs_forward = self.forward_rnn(
+            inputs,
+            initial_carry=initial_carry_forward,
+            rngs=rngs,
+            seq_lengths=seq_lengths,
+            return_carry=True,
+            time_major=time_major,
+            reverse=False,
+        )
+
+        # Encode in the backward direction.
+        carry_backward, outputs_backward = self.backward_rnn(
+            inputs,
+            initial_carry=initial_carry_backward,
+            rngs=rngs,
+            seq_lengths=seq_lengths,
+            return_carry=True,
+            time_major=time_major,
+            reverse=True,
+            keep_order=True,
+        )
+
+        carry = (carry_forward, carry_backward) if return_carry else None
+        outputs = jax.tree_util.tree_map(
+            self.merge_fn, outputs_forward, outputs_backward
+        )
+
+        if return_carry:
+            return carry, outputs
+        else:
+            return outputs
+
+
 @nnx.jit
 def run_layer(layer, inputs):
     carry = layer.initialize_carry(None, inputs.shape)
@@ -474,14 +897,32 @@ def run_model(model, inputs):
 
 if __name__ == "__main__":
     rngs = nnx.Rngs(0)
-    batch_size, seq_len, feature_size, hidden_size = 2,3,4,5 #48, 32, 16, 64
+    batch_size, seq_len, feature_size, hidden_size = 48, 32, 16, 64
     x = jax.random.normal(jax.random.PRNGKey(0), (batch_size, seq_len, feature_size))
     # layer = SimpleCell(
     #     in_features=feature_size, hidden_features=hidden_size, rngs=rngs
     # )
     layer = LSTMCell(in_features=feature_size, hidden_features=hidden_size, rngs=rngs)
-    rnn = RNN(layer, time_major=True, reverse=True, keep_order=False, unroll=1)
+    # layer = OptimizedLSTMCell(in_features=feature_size, hidden_features=hidden_size, rngs=rngs)
+    # layer = GRUCell(in_features=feature_size, hidden_features=hidden_size, rngs=rngs)
+    rnn = RNN(
+        layer,
+        time_major=False,
+        reverse=False,
+        keep_order=False,
+        unroll=1,
+        return_carry=False,
+    )
     from timeit import timeit
 
-    print(run_model(rnn, x))
+    output = run_model(rnn, x)
+    print(output.shape)
+
     print(timeit(lambda: run_model(rnn, x), number=100))
+
+    bidirectional = Bidirectional(
+        forward_rnn=rnn, backward_rnn=rnn, time_major=False, return_carry=True
+    )
+    ((c1, h1), (c2, h2)), output = run_model(bidirectional, x)  # for lstm
+    print(output.shape)
+    print(c1.shape)
