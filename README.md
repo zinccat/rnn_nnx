@@ -1,4 +1,6 @@
 # rnn_nnx
+Update: Merged into https://github.com/google/flax in https://github.com/google/flax/pull/4272
+
 Implementation of RNN using Flax NNX, ported from Flax Linen.
 
 ## Usage
